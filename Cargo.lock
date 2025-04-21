@@ -6891,6 +6891,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "q_windows_wrapper"
+version = "1.7.3"
+dependencies = [
+ "camino",
+ "clap",
+ "dirs",
+ "eyre",
+ "fig_util",
+ "shlex",
+ "tempfile",
+ "thiserror 2.0.12",
+ "tracing",
+ "tracing-subscriber",
+ "which 6.0.3",
+ "winapi",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

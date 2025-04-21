@@ -1,0 +1,43 @@
+[package]
+name = "q_windows_wrapper"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+publish.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Windows wrapper for the Amazon Q CLI"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+eyre = { workspace = true }
+
+# Path and environment handling
+dirs = { workspace = true }
+which = { workspace = true }
+camino = { workspace = true }
+
+# Windows-specific dependencies
+winapi = { version = "0.3", features = ["processenv", "winbase", "handleapi", "processthreadsapi", "winuser"] }
+
+# Command line argument handling
+clap = { workspace = true }
+shlex = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utility
+fig_util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52.0", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
