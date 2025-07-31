@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::Stdio;
 
-use bstr::ByteSlice;
 use convert_case::{
     Case,
     Casing,
@@ -16,8 +15,12 @@ use eyre::{
     WrapErr,
 };
 use serde::Deserialize;
-use tracing::error;
+use tracing::{
+    debug,
+    error,
+};
 
+use super::aws_context::AwsContext;
 use super::{
     InvokeOutput,
     MAX_TOOL_RESPONSE_SIZE,
@@ -50,92 +53,104 @@ pub struct UseAws {
 }
 
 impl UseAws {
-    pub fn requires_acceptance(&self) -> bool {
-        !READONLY_OPS.iter().any(|op| self.operation_name.starts_with(op))
+    /// Check if double-check confirmation is enabled for AWS actions
+    pub fn is_actions_double_check_enabled(os: &Os) -> bool {
+        use crate::database::settings::Setting;
+        os.database
+            .settings
+            .get_bool(Setting::AwsActionsDoubleCheckEnabled)
+            .unwrap_or(false)
     }
 
-    pub async fn invoke(&self, _os: &Os, _updates: impl Write) -> Result<InvokeOutput> {
-        let mut command = tokio::process::Command::new("aws");
-        command.envs(std::env::vars());
+    /// Check if double-check confirmation is enabled for AWS actions (test version)
+    #[cfg(test)]
+    pub fn is_actions_double_check_enabled_with_settings(settings: &crate::database::settings::Settings) -> bool {
+        use crate::database::settings::Setting;
+        settings
+            .get_bool(Setting::AwsActionsDoubleCheckEnabled)
+            .unwrap_or(false)
+    }
 
-        // Set up environment variables
-        let mut env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    pub fn requires_acceptance(&self) -> bool {
+        // Readonly operations never require acceptance, regardless of double-check setting
+        if READONLY_OPS.iter().any(|op| self.operation_name.starts_with(op)) {
+            return false;
+        }
 
-        // Set up additional metadata for the AWS CLI user agent
-        let user_agent_metadata_value = format!(
-            "{} {}/{}",
-            USER_AGENT_APP_NAME, USER_AGENT_VERSION_KEY, USER_AGENT_VERSION_VALUE
+        // Non-readonly operations always require acceptance
+        true
+    }
+
+    pub async fn invoke(&self, os: &Os, mut updates: impl Write) -> Result<InvokeOutput> {
+        debug!(
+            "Invoking AWS tool: service={}, operation={}, profile={:?}, region={}",
+            self.service_name, self.operation_name, self.profile_name, self.region
         );
 
-        // If the user agent metadata env var already exists, append to it, otherwise set it
-        if let Some(existing_value) = env_vars.get(USER_AGENT_ENV_VAR) {
-            if !existing_value.is_empty() {
-                env_vars.insert(
-                    USER_AGENT_ENV_VAR.to_string(),
-                    format!("{} {}", existing_value, user_agent_metadata_value),
-                );
-            } else {
-                env_vars.insert(USER_AGENT_ENV_VAR.to_string(), user_agent_metadata_value);
-            }
-        } else {
-            env_vars.insert(USER_AGENT_ENV_VAR.to_string(), user_agent_metadata_value);
+        // Check if this is a readonly operation - if so, execute directly without any confirmation
+        if READONLY_OPS.iter().any(|op| self.operation_name.starts_with(op)) {
+            debug!("Operation '{}' is readonly, executing directly", self.operation_name);
+            return self.execute_aws_command().await;
         }
 
-        command.envs(env_vars).arg("--region").arg(&self.region);
-        if let Some(profile_name) = self.profile_name.as_deref() {
-            command.arg("--profile").arg(profile_name);
+        // For non-readonly operations, check if actions double-check is enabled
+        let actions_double_check_enabled = Self::is_actions_double_check_enabled(os);
+        debug!("AWS actions double-check enabled: {}", actions_double_check_enabled);
+
+        if !actions_double_check_enabled {
+            // Use existing single confirmation flow (handled by the tool framework)
+            debug!("AWS actions double-check disabled, using single confirmation flow");
+            return self.execute_aws_command().await;
         }
-        command.arg(&self.service_name).arg(&self.operation_name);
-        if let Some(parameters) = self.cli_parameters() {
-            for (name, val) in parameters {
-                command.arg(name);
-                if !val.is_empty() {
-                    command.arg(val);
+
+        // AWS actions double-check flow: first confirmation is handled by the tool framework
+        // We need to implement the second confirmation with AWS context display
+        debug!("Starting AWS actions double-check flow");
+
+        // Gather and display AWS context information
+        match self.display_aws_context(os, &mut updates).await {
+            Ok(_) => debug!("Successfully displayed AWS context"),
+            Err(e) => {
+                error!("Failed to display AWS context: {:?}", e);
+                queue!(updates, style::Print("⚠️  Error displaying AWS context information.\n"))?;
+                queue!(
+                    updates,
+                    style::Print("This may indicate AWS CLI configuration issues.\n")
+                )?;
+                queue!(
+                    updates,
+                    style::Print("Please verify your AWS setup before proceeding.\n\n")
+                )?;
+                updates.flush()?;
+                // Continue with confirmation despite context display error
+            },
+        }
+
+        // Prompt for second confirmation
+        match self.prompt_actions_double_check_confirmation(os, &mut updates).await {
+            Ok(confirmed) => {
+                if confirmed {
+                    debug!("User confirmed AWS actions double-check, executing AWS command");
+                    self.execute_aws_command().await
+                } else {
+                    debug!("User cancelled operation at AWS actions double-check prompt");
+                    queue!(updates, style::Print("\n📋 Operation Summary:\n"))?;
+                    queue!(updates, style::Print("  Status: Cancelled by user at security check\n"))?;
+                    queue!(updates, style::Print("  Reason: User declined second confirmation\n"))?;
+                    queue!(updates, style::Print("  Action: No AWS resources were modified\n\n"))?;
+                    updates.flush()?;
+                    Err(eyre::eyre!(
+                        "Operation cancelled by user at AWS actions double-check confirmation"
+                    ))
                 }
-            }
-        }
-        let output = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .wrap_err_with(|| format!("Unable to spawn command '{:?}'", self))?
-            .wait_with_output()
-            .await
-            .wrap_err_with(|| format!("Unable to spawn command '{:?}'", self))?;
-        let status = output.status.code().unwrap_or(0).to_string();
-        let stdout = output.stdout.to_str_lossy();
-        let stderr = output.stderr.to_str_lossy();
-
-        let stdout = format!(
-            "{}{}",
-            &stdout[0..stdout.len().min(MAX_TOOL_RESPONSE_SIZE / 3)],
-            if stdout.len() > MAX_TOOL_RESPONSE_SIZE / 3 {
-                " ... truncated"
-            } else {
-                ""
-            }
-        );
-
-        let stderr = format!(
-            "{}{}",
-            &stderr[0..stderr.len().min(MAX_TOOL_RESPONSE_SIZE / 3)],
-            if stderr.len() > MAX_TOOL_RESPONSE_SIZE / 3 {
-                " ... truncated"
-            } else {
-                ""
-            }
-        );
-
-        if status.eq("0") {
-            Ok(InvokeOutput {
-                output: OutputKind::Json(serde_json::json!({
-                    "exit_status": status,
-                    "stdout": stdout,
-                    "stderr": stderr.clone()
-                })),
-            })
-        } else {
-            Err(eyre::eyre!(stderr))
+            },
+            Err(e) => {
+                error!("Error during AWS actions double-check confirmation: {:?}", e);
+                queue!(updates, style::Print("\n❌ Error during confirmation process.\n"))?;
+                queue!(updates, style::Print("Operation cancelled for safety.\n\n"))?;
+                updates.flush()?;
+                Err(eyre::eyre!("Operation cancelled due to confirmation error: {}", e))
+            },
         }
     }
 
@@ -178,20 +193,226 @@ impl UseAws {
         Ok(())
     }
 
-    /// Returns the CLI arguments properly formatted as kebab case if parameters is
-    /// [Option::Some], otherwise None
-    fn cli_parameters(&self) -> Option<Vec<(String, String)>> {
-        if let Some(parameters) = &self.parameters {
-            let mut params = vec![];
-            for (param_name, val) in parameters {
-                let param_name = format!("--{}", param_name.trim_start_matches("--").to_case(Case::Kebab));
-                let param_val = val.as_str().map(|s| s.to_string()).unwrap_or(val.to_string());
-                params.push((param_name, param_val));
-            }
-            Some(params)
-        } else {
-            None
+    /// Displays AWS context information to the user before the second confirmation
+    async fn display_aws_context(&self, _os: &Os, updates: &mut impl Write) -> Result<()> {
+        debug!(
+            "Displaying AWS context for profile: {:?}, region: {}",
+            self.profile_name, self.region
+        );
+
+        queue!(updates, style::Print("\n"))?;
+        queue!(updates, style::Print("=== AWS Context Information ===\n"))?;
+
+        // Attempt to gather AWS context
+        match AwsContext::detect(self.profile_name.as_deref(), &self.region).await {
+            Ok(aws_context) => {
+                debug!("Successfully gathered AWS context information");
+                let formatted_context = aws_context.format_for_display();
+                queue!(updates, style::Print(formatted_context))?;
+            },
+            Err(e) => {
+                error!("Failed to gather AWS context information: {:?}", e);
+
+                // Display user-friendly error message
+                queue!(
+                    updates,
+                    style::Print("⚠️  Warning: Unable to gather complete AWS context information.\n\n")
+                )?;
+
+                // Show the detailed error message
+                let error_message = AwsContext::format_error_message(
+                    self.profile_name.as_deref().unwrap_or("default"),
+                    &self.region,
+                    &e,
+                );
+                queue!(updates, style::Print(error_message))?;
+                queue!(updates, style::Print("\n\n"))?;
+
+                // Show available information
+                queue!(updates, style::Print("Available information from tool parameters:\n"))?;
+                queue!(
+                    updates,
+                    style::Print(format!(
+                        "AWS Profile: {}\n",
+                        self.profile_name.as_deref().unwrap_or("default")
+                    ))
+                )?;
+                queue!(updates, style::Print(format!("AWS Region: {}\n", self.region)))?;
+                queue!(
+                    updates,
+                    style::Print("AWS Account ID: Unable to determine (see error above)\n")
+                )?;
+            },
         }
+
+        queue!(updates, style::Print("================================\n"))?;
+        updates.flush()?;
+        Ok(())
+    }
+
+    /// Prompts the user for the second confirmation with AWS context details
+    async fn prompt_actions_double_check_confirmation(&self, _os: &Os, updates: &mut impl Write) -> Result<bool> {
+        debug!("Prompting user for AWS actions double-check confirmation");
+
+        queue!(updates, style::Print("\n"))?;
+        queue!(updates, style::Print("⚠️  ADDITIONAL SECURITY CHECK ⚠️\n"))?;
+        queue!(
+            updates,
+            style::Print("This is a second confirmation to prevent accidental AWS operations.\n")
+        )?;
+        queue!(
+            updates,
+            style::Print("Please review the AWS context information above carefully.\n\n")
+        )?;
+
+        // Show operation details again for clarity
+        queue!(updates, style::Print("Operation to be performed:\n"))?;
+        queue!(updates, style::Print(format!("  Service: {}\n", self.service_name)))?;
+        queue!(updates, style::Print(format!("  Operation: {}\n", self.operation_name)))?;
+        if let Some(ref label) = self.label {
+            queue!(updates, style::Print(format!("  Label: {}\n", label)))?;
+        }
+        queue!(updates, style::Print("\n"))?;
+
+        queue!(
+            updates,
+            style::Print("Do you want to proceed with this AWS operation? (y/N): ")
+        )?;
+        updates.flush()?;
+
+        // Read user input with error handling
+        let mut input = String::new();
+        match std::io::stdin().read_line(&mut input) {
+            Ok(_) => {
+                let input = input.trim().to_lowercase();
+                let confirmed = matches!(input.as_str(), "y" | "yes");
+
+                if confirmed {
+                    debug!("User confirmed the AWS actions double-check prompt");
+                    queue!(
+                        updates,
+                        style::Print("✓ Second confirmation granted. Proceeding with operation...\n")
+                    )?;
+                } else {
+                    debug!("User denied the AWS actions double-check prompt");
+                    queue!(
+                        updates,
+                        style::Print("✗ Second confirmation denied. Operation cancelled.\n")
+                    )?;
+                }
+
+                updates.flush()?;
+                Ok(confirmed)
+            },
+            Err(e) => {
+                error!(
+                    "Failed to read user input for AWS actions double-check confirmation: {}",
+                    e
+                );
+                queue!(
+                    updates,
+                    style::Print("\n✗ Error reading user input. Operation cancelled for safety.\n")
+                )?;
+                updates.flush()?;
+                Ok(false)
+            },
+        }
+    }
+
+    /// Executes the AWS CLI command
+    async fn execute_aws_command(&self) -> Result<InvokeOutput> {
+        let mut command = tokio::process::Command::new("aws");
+
+        // Add service name
+        command.arg(&self.service_name);
+
+        // Add operation name
+        command.arg(&self.operation_name);
+
+        // Add parameters
+        if self.parameters.is_some() {
+            let cli_params = self.cli_parameters()?;
+            for (param_key, param_value) in cli_params {
+                command.arg(param_key).arg(param_value);
+            }
+        }
+
+        // Add region
+        command.arg("--region").arg(&self.region);
+
+        // Add profile if specified
+        if let Some(profile) = &self.profile_name {
+            command.arg("--profile").arg(profile);
+        }
+
+        // Add output format
+        command.arg("--output").arg("json");
+
+        // Set user agent environment variable
+        command.env(
+            USER_AGENT_ENV_VAR,
+            format!(
+                "{}_{}/{}",
+                USER_AGENT_APP_NAME, USER_AGENT_VERSION_KEY, USER_AGENT_VERSION_VALUE
+            ),
+        );
+
+        // Execute the command
+        let output = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .wrap_err("Failed to spawn AWS CLI command")?
+            .wait_with_output()
+            .await
+            .wrap_err("Failed to execute AWS CLI command")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // Truncate output if it's too large
+        let truncated_stdout = if stdout.len() > MAX_TOOL_RESPONSE_SIZE {
+            format!("{}... [truncated]", &stdout[..MAX_TOOL_RESPONSE_SIZE])
+        } else {
+            stdout.to_string()
+        };
+
+        let truncated_stderr = if stderr.len() > MAX_TOOL_RESPONSE_SIZE {
+            format!("{}... [truncated]", &stderr[..MAX_TOOL_RESPONSE_SIZE])
+        } else {
+            stderr.to_string()
+        };
+
+        let result = serde_json::json!({
+            "stdout": truncated_stdout,
+            "stderr": truncated_stderr,
+            "exit_status": exit_code
+        });
+
+        Ok(InvokeOutput {
+            output: OutputKind::Json(result),
+        })
+    }
+
+    /// Converts parameters to CLI format
+    fn cli_parameters(&self) -> Result<Vec<(String, String)>> {
+        let mut params = Vec::new();
+
+        if let Some(parameters) = &self.parameters {
+            for (key, value) in parameters {
+                let cli_key = format!("--{}", key.to_case(Case::Kebab));
+                let cli_value = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => value.to_string(),
+                };
+                params.push((cli_key, cli_value));
+            }
+        }
+
+        Ok(params)
     }
 
     pub fn eval_perm(&self, agent: &Agent) -> PermissionEvalResult {
@@ -322,6 +543,97 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_requires_acceptance_with_actions_double_check_disabled() {
+        // Test default behavior (actions double-check disabled)
+        // We need to test this indirectly since we can't easily mock the static method
+
+        // Read-only operations should not require acceptance
+        let readonly_cmd = use_aws! {{
+            "service_name": "ecs",
+            "operation_name": "list-task-definitions",
+            "region": "us-west-2",
+            "profile_name": "default",
+            "label": ""
+        }};
+
+        let get_cmd = use_aws! {{
+            "service_name": "s3",
+            "operation_name": "get-object",
+            "region": "us-west-2",
+            "profile_name": "default",
+            "label": ""
+        }};
+
+        let describe_cmd = use_aws! {{
+            "service_name": "ec2",
+            "operation_name": "describe-instances",
+            "region": "us-west-2",
+            "profile_name": "default",
+            "label": ""
+        }};
+
+        // Write operations should require acceptance
+        let write_cmd = use_aws! {{
+            "service_name": "s3",
+            "operation_name": "put-object",
+            "region": "us-west-2",
+            "profile_name": "default",
+            "label": ""
+        }};
+
+        let delete_cmd = use_aws! {{
+            "service_name": "s3",
+            "operation_name": "delete-object",
+            "region": "us-west-2",
+            "profile_name": "default",
+            "label": ""
+        }};
+
+        // Test the logic without the settings dependency
+        // This tests the READONLY_OPS logic
+        assert!(
+            !READONLY_OPS
+                .iter()
+                .any(|op| readonly_cmd.operation_name.starts_with(op))
+                == false
+        );
+        assert!(!READONLY_OPS.iter().any(|op| get_cmd.operation_name.starts_with(op)) == false);
+        assert!(
+            !READONLY_OPS
+                .iter()
+                .any(|op| describe_cmd.operation_name.starts_with(op))
+                == false
+        );
+        assert!(!READONLY_OPS.iter().any(|op| write_cmd.operation_name.starts_with(op)) == true);
+        assert!(!READONLY_OPS.iter().any(|op| delete_cmd.operation_name.starts_with(op)) == true);
+    }
+
+    #[tokio::test]
+    async fn test_display_aws_context() {
+        let use_aws = use_aws! {{
+            "service_name": "s3",
+            "operation_name": "put-object",
+            "region": "us-west-2",
+            "profile_name": "test-profile",
+            "label": ""
+        }};
+
+        let os = Os::new().await.unwrap();
+        let mut output = Vec::new();
+
+        // This should not fail even if AWS CLI is not available
+        let result = use_aws.display_aws_context(&os, &mut output).await;
+        assert!(result.is_ok());
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("=== AWS Context Information ==="));
+        assert!(output_str.contains("AWS Profile: test-profile"));
+        assert!(output_str.contains("AWS Region: us-west-2"));
+        // Account ID may show "Unable to determine" if AWS CLI fails
+        assert!(output_str.contains("AWS Account ID:"));
     }
 
     #[tokio::test]

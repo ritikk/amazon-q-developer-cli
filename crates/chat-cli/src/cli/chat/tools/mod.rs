@@ -1,3 +1,4 @@
+pub mod aws_context;
 pub mod custom_tool;
 pub mod execute;
 pub mod fs_read;
